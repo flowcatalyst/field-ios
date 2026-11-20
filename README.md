@@ -100,6 +100,12 @@ read into memory and the request is never retried (Kotlin: one-shot bodies). For
 Offline queues: store requests unsigned and sign when sending. Platform `/field/` nonces are single-use, application
 nonces last about 5-10 minutes and `iat` may be off by +-24 h, so a stored proof is useless.
 
+With no signal the session stays: a call that cannot reach the platform fails with `NETWORK` and ends nothing, and
+no session is ended by the device's clock. It ends when the platform refuses a refresh after the signal returns
+(`SESSION_EXPIRED` once the idle or absolute limit has passed), and sign-in itself needs the platform. The limits,
+what `keepAlive` can and cannot do offline, and the rules for a queue on a shared device are in
+`clients/field-react-native/README.md`, "No signal: what happens to a session"; they hold for this library too.
+
 ## API (Swift name, Kotlin name)
 
 `FlowCatalystFieldCore` (all `public`):
@@ -151,6 +157,26 @@ nonces last about 5-10 minutes and `iat` may be off by +-24 h, so a stored proof
 | `DeviceInfo.current` | `DeviceInfo(model = Build.MODEL)` |
 
 Not ported: `headersForBlocking` (no blocking form in Swift; use `await`).
+
+## The worker's own photo
+
+`session.worker.photoVersion` (nil when there is none, or photos are off) and `session.worker.canSetOwnPhoto` (true only
+when the client lets workers set their own and the session is the worker's own) are kept with the session across restarts.
+A photo changed or removed elsewhere shows as a different `photoVersion` at the next sign-in or refresh, each time with a
+`.sessionChanged`; there is no separate event.
+
+```swift
+let photo = try await session.getPhoto(size: .thumb, haveVersion: held)   // nil: no photo; photo.notModified: keep yours
+if worker.canSetOwnPhoto {
+    try await session.setPhoto(jpegData, contentType: "image/jpeg")       // JPEG, PNG or WebP; decided from the bytes
+    try await session.removePhoto()
+}
+```
+
+Each call is signed like the others (nonce, single refresher). Refusals are `FieldAuthError` codes: `OWN_PHOTO_NOT_ALLOWED`,
+`PHOTOS_DISABLED`, `PHOTOS_DISABLED_FOR_CLIENT`, `IMPERSONATING` (reading is allowed while impersonating, changing is not),
+`PHOTO_EMPTY`, `PHOTO_TOO_LARGE`, `PHOTO_UNSUPPORTED_TYPE`, `PHOTO_TYPE_MISMATCH`, `PHOTO_DIMENSIONS_TOO_LARGE`,
+`PHOTO_UNREADABLE`, `PHOTO_BUSY`, and `TOO_MANY_REQUESTS` with `retryAfterSeconds`.
 
 ## Errors
 
