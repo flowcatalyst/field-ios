@@ -41,11 +41,11 @@ final class SoftKeyProvider: DeviceKeyProvider, @unchecked Sendable {
     let privateKey = P256.Signing.PrivateKey()
     let key: DeviceKey
 
-    init() {
+    init(level: String = "NONE", chain: [String]? = nil) {
         let x963 = [UInt8](privateKey.publicKey.x963Representation)
         key = DeviceKey(
             x: DerSignature.toBase64Url(Array(x963[1..<33])),
-            y: DerSignature.toBase64Url(Array(x963[33..<65])))
+            y: DerSignature.toBase64Url(Array(x963[33..<65])), attestationChain: chain, level: level)
     }
 
     func getOrCreate() throws -> DeviceKey { key }
@@ -207,6 +207,8 @@ struct Unreachable: Error {}
 final class FakeNetwork: HTTPTransport, @unchecked Sendable {
     private let routes = Locked<[String: (Rec) -> FakeResponse]>([:])
     let activity: Activity
+    /// While true every request fails before an answer: the library sees no network.
+    let offline = Locked<Bool>(false)
 
     init(activity: Activity) { self.activity = activity }
 
@@ -214,6 +216,7 @@ final class FakeNetwork: HTTPTransport, @unchecked Sendable {
 
     func send(_ request: HTTPRequest) async throws -> HTTPResponse {
         activity.bump()
+        if offline.value { throw Unreachable() }
         guard let url = HTTPURL(request.url), let route = routes.value[url.origin] else { throw Unreachable() }
         let comps = URLComponents(string: request.url)
         let path = (comps?.percentEncodedPath ?? "/") + (comps?.percentEncodedQuery.map { "?" + $0 } ?? "")
@@ -285,14 +288,14 @@ final class FakePlatform: @unchecked Sendable {
     func token(
         workerId: String = "w1", workerCode: String = "W001", claims: JObject = [:],
         pinChangeRequired: Bool = false, refreshExpiresAt: Int64? = nil,
-        photoVersion: String? = nil, canSetOwnPhoto: Bool = false
+        photoVersion: String? = nil, canSetOwnPhoto: Bool = false, unlockKeys: JObject? = nil
     ) -> FakeResponse {
         let n = tokenSeq.mutate { $0 += 1; return $0 }
         var c = claims
         c["jti"] = "at-\(n)"
         let jwt = Base64URL.encode(Data(#"{"alg":"none"}"#.utf8)) + "." + Base64URL.encode(JSON.data(c)) + ".sig"
         let now = clockFn.value()
-        let body: JObject = [
+        var body: JObject = [
             "accessToken": jwt,
             "tokenType": "DPoP",
             "expiresIn": accessLifetimeSec.value,
@@ -305,6 +308,7 @@ final class FakePlatform: @unchecked Sendable {
             ] as JObject,
             "pinChangeRequired": pinChangeRequired,
         ]
+        if let unlockKeys { body["unlockKeys"] = unlockKeys }
         return .json(200, JSON.string(body))
     }
 
@@ -358,13 +362,21 @@ final class Harness: @unchecked Sendable {
     let activity = Activity()
     let clock: TestClock
     let storage = InMemoryStorage()
-    let keys = SoftKeyProvider()
+    let keys: SoftKeyProvider
+    let unlockKeys: UnlockKeyProvider?
+    let unlockKeyPrompter: UnlockKeyPrompter?
     let net: FakeNetwork
     let platform: FakePlatform
     let app: FakeApp
     let events = EventLog()
 
-    init() {
+    init(
+        keyLevel: String = "NONE", keyChain: [String]? = nil, unlockKeys: UnlockKeyProvider? = nil,
+        unlockKeyPrompter: UnlockKeyPrompter? = nil
+    ) {
+        keys = SoftKeyProvider(level: keyLevel, chain: keyChain)
+        self.unlockKeys = unlockKeys
+        self.unlockKeyPrompter = unlockKeyPrompter
         clock = TestClock(activity: activity)
         net = FakeNetwork(activity: activity)
         let c = clock
@@ -384,7 +396,7 @@ final class Harness: @unchecked Sendable {
         let log = events
         let s = FieldSession(
             config: config ?? self.config(), storage: storage ?? self.storage, keys: keys,
-            transport: transport ?? net, clock: clock)
+            transport: transport ?? net, clock: clock, unlockKeys: unlockKeys, unlockKeyPrompter: unlockKeyPrompter)
         s.addListener { log.add($0) }
         return s
     }
@@ -410,5 +422,79 @@ extension XCTestCase {
             XCTFail("expected FieldAuthError \(code), got \(error)", file: file, line: line)
         }
         return nil
+    }
+}
+
+// MARK: - unlock keys
+
+/// ES256 verification of a compact JWS against a P-256 public key given as JWK x / y (base64url).
+func verifyEs256(_ jws: String, x: String, y: String) -> Bool {
+    let parts = jws.split(separator: ".", omittingEmptySubsequences: false).map(String.init)
+    guard parts.count == 3, let xd = Base64URL.decode(x), let yd = Base64URL.decode(y),
+          let sigBytes = Base64URL.decode(parts[2]), sigBytes.count == 64,
+          let pub = try? P256.Signing.PublicKey(x963Representation: Data([4]) + xd + yd),
+          let sig = try? P256.Signing.ECDSASignature(rawRepresentation: sigBytes)
+    else { return false }
+    return pub.isValidSignature(sig, for: Data((parts[0] + "." + parts[1]).utf8))
+}
+
+func jwsHeader(_ jws: String) -> JObject { JSON.parseObject(Base64URL.decode(String(jws.split(separator: ".")[0]))!)! }
+func jwsClaims(_ jws: String) -> JObject { JSON.parseObject(Base64URL.decode(String(jws.split(separator: ".")[1]))!)! }
+
+/// Software P-256 unlock keys behind the Secure Enclave's interface; tests flip `biometric`, `level` and `invalidated`.
+final class SoftUnlockKeys: UnlockKeyProvider, @unchecked Sendable {
+    let biometric = Locked<UnlockKeyAvailability>(.available)
+    let level = Locked<String>("TEE")
+    let chain = Locked<[String]?>(nil)
+    let keys = Locked<[String: P256.Signing.PrivateKey]>([:])
+    let invalidated = Locked<Set<String>>([])
+    let deleted = Locked<[String]>([])
+    let created = Locked<Int>(0)
+
+    func biometricStatus() -> UnlockKeyAvailability { biometric.value }
+    /// The Secure Enclave's answer by default (no attestation); a test may say yes to check the attesting path.
+    let canAttest = Locked<Bool>(false)
+    var attests: Bool { canAttest.value }
+
+    func create(alias: String) throws -> UnlockKeyMaterial {
+        let k = P256.Signing.PrivateKey()
+        keys.mutate { $0[alias] = k }
+        created.mutate { $0 += 1 }
+        let b = [UInt8](k.publicKey.x963Representation)
+        return UnlockKeyMaterial(
+            x: DerSignature.toBase64Url(Array(b[1..<33])), y: DerSignature.toBase64Url(Array(b[33..<65])),
+            attestationChain: chain.value, level: level.value)
+    }
+
+    func prepare(alias: String) throws -> PreparedSignature {
+        guard let k = keys.value[alias], !invalidated.value.contains(alias) else {
+            throw FcFieldError(code: "KEY_INVALIDATED", message: "gone")
+        }
+        return SoftSignature(key: k)
+    }
+
+    func delete(alias: String) throws {
+        keys.mutate { _ = $0.removeValue(forKey: alias) }
+        deleted.mutate { $0.append(alias) }
+    }
+
+    var aliases: Set<String> { Set(keys.value.keys) }
+}
+
+struct SoftSignature: PreparedSignature {
+    let key: P256.Signing.PrivateKey
+    func sign(_ data: Data) throws -> Data {
+        Data(try DerSignature.derToRaw([UInt8](try key.signature(for: data).derRepresentation)))
+    }
+}
+
+/// A prompt that signs (a "biometric match") or throws, counting how often it was shown.
+struct FakeUnlockPrompter: UnlockKeyPrompter {
+    let shown: Locked<Int>
+    let body: @Sendable (UnlockKeyPrompt, PreparedSignature, Data) throws -> Data
+
+    func authorise(_ prompt: UnlockKeyPrompt, signature: PreparedSignature, data: Data) async throws -> Data {
+        shown.mutate { $0 += 1 }
+        return try body(prompt, signature, data)
     }
 }
